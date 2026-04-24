@@ -131,7 +131,7 @@ def hmac_required(f):
 
 
 # ========= Key Format: Vortex-XXXX-XXXX-XXXX =========
-KEY_PREFIX = "Vortex"
+KEY_PREFIX = "CBHADLG"
 KEY_SEGMENT_LENGTH = 4
 KEY_SEGMENT_COUNT = 3   # results in: Vortex-XXXX-XXXX-XXXX
 KEY_CHARS = string.ascii_uppercase + string.digits
