@@ -130,31 +130,68 @@ def hmac_required(f):
     return w
 
 
-# ========= Key Format: Vortex-XXXX-XXXX-XXXX =========
-KEY_PREFIX = "CBHADLG"
-KEY_SEGMENT_LENGTH = 4
-KEY_SEGMENT_COUNT = 3   # results in: Vortex-XXXX-XXXX-XXXX
+# ========= Key Format: ShopBoutique - XXXXXXXX =========
+KEY_PREFIX = "ShopBoutiqueLegit"
+KEY_SUFFIX_LENGTH = 8
 KEY_CHARS = string.ascii_uppercase + string.digits
 
 
 def generate_key_string() -> str:
-    segments = [
-        ''.join(random.choices(KEY_CHARS, k=KEY_SEGMENT_LENGTH))
-        for _ in range(KEY_SEGMENT_COUNT)
-    ]
-    return f"{KEY_PREFIX}-" + "-".join(segments)
+    suffix = ''.join(random.choices(KEY_CHARS, k=KEY_SUFFIX_LENGTH))
+    return f"{KEY_PREFIX} - {suffix}"
 
 
 def is_valid_key_format(key_string: str) -> bool:
     """Quick sanity check — rejects obviously malformed keys."""
     if not isinstance(key_string, str):
         return False
-    parts = key_string.split("-")
-    if len(parts) != KEY_SEGMENT_COUNT + 1:
+    expected_sep = f"{KEY_PREFIX} - "
+    if not key_string.startswith(expected_sep):
         return False
-    if parts[0] != KEY_PREFIX:
+    suffix = key_string[len(expected_sep):]
+    if len(suffix) < 3 or len(suffix) > 32:
         return False
-    return all(len(p) == KEY_SEGMENT_LENGTH and p.isalnum() for p in parts[1:])
+    return suffix.isalnum()
+
+
+# ========= Duration helpers =========
+def _parse_duration_from_request(data: dict) -> tuple[int | None, int | None, str | None]:
+    """
+    Returns (duration_days, duration_hours, error_message).
+    Use hours OR days, not both. Preset: duration_preset = '3h'
+    """
+    preset = (data.get('duration_preset') or '').strip().lower()
+    if preset in ('3h', '3hours', '3_gio', '3gio'):
+        return 0, 3, None
+
+    if 'hours' in data and data.get('hours') is not None:
+        try:
+            hours = int(data['hours'])
+        except (ValueError, TypeError):
+            return None, None, "hours không hợp lệ — phải là số nguyên dương"
+        if hours <= 0:
+            return None, None, "Số giờ phải > 0"
+        return 0, hours, None
+
+    if 'days' in data and data.get('days') is not None:
+        try:
+            days = int(data['days'])
+        except (ValueError, TypeError):
+            return None, None, "days không hợp lệ — phải là số nguyên dương"
+        if days <= 0:
+            return None, None, "Số ngày phải > 0"
+        return days, None, None
+
+    # Default: 3 days (backward compatible)
+    return int(data.get('days', 3) if data.get('days') is not None else 3), None, None
+
+
+def _duration_label(key_data: dict) -> str:
+    hours = key_data.get('duration_hours')
+    if hours:
+        return f"{hours} giờ"
+    days = key_data.get('duration_days', 0)
+    return f"{days} ngày"
 
 
 # ========= Firestore Helpers =========
@@ -175,11 +212,17 @@ def _parse_iso(dt_str: str):
         return None
 
 
-def _compute_expiry(first_activated_at: str, duration_days: int) -> datetime | None:
+def _compute_expiry(first_activated_at: str, key_data: dict) -> datetime | None:
     dt = _parse_iso(first_activated_at)
     if dt is None:
         return None
-    return dt + timedelta(days=duration_days)
+    hours = key_data.get('duration_hours')
+    if hours:
+        return dt + timedelta(hours=int(hours))
+    days = key_data.get('duration_days', 0)
+    if days <= 0:
+        return None
+    return dt + timedelta(days=int(days))
 
 
 def update_usage_tracking(key_doc_ref, key_data: dict, hwid: str,
@@ -225,11 +268,10 @@ def _build_status(kd: dict, now: datetime) -> tuple[str, str]:
         return "BANNED", kd.get('expires_at') or "N/A"
 
     fa = kd.get('first_activated_at')
-    dur = kd.get('duration_days', 0)
     if not fa:
         return "Chưa kích hoạt", "Chưa kích hoạt"
 
-    exp = _compute_expiry(fa, dur)
+    exp = _compute_expiry(fa, kd)
     if exp is None:
         return "Chưa kích hoạt", "Chưa kích hoạt"
 
@@ -246,7 +288,7 @@ def _check_db() -> bool:
 
 @app.route('/')
 def home():
-    return jsonify({"status": "ok", "service": "Vortex Key Backend"})
+    return jsonify({"status": "ok", "service": "Shop Boutique Key Backend"})
 
 
 @app.route('/api/session')
@@ -289,13 +331,9 @@ def create_key():
         return jsonify({"error": "Lỗi kết nối cơ sở dữ liệu"}), 500
 
     data = request.get_json() or {}
-    try:
-        days = int(data.get('days', 3))
-    except (ValueError, TypeError):
-        return jsonify({"error": "days không hợp lệ — phải là số nguyên dương"}), 400
-
-    if days <= 0:
-        return jsonify({"error": "Số ngày phải > 0"}), 400
+    duration_days, duration_hours, dur_err = _parse_duration_from_request(data)
+    if dur_err:
+        return jsonify({"error": dur_err}), 400
 
     key_type = data.get('key_type', 'single_device')
     if key_type not in ('single_device', 'multi_device'):
@@ -313,7 +351,8 @@ def create_key():
     key_data = {
         "key_string": key_string,
         "key_type": key_type,
-        "duration_days": days,
+        "duration_days": duration_days or 0,
+        "duration_hours": duration_hours,
         "expires_at": None,
         "created_at": _now_iso(),
         "created_by": (data.get('created_by') or 'AdminPanel').strip()[:64],
@@ -328,11 +367,72 @@ def create_key():
 
     try:
         key_doc_ref.set(key_data)
-        return jsonify({
+        resp = {
             "message": "Tạo key thành công!",
             "key": key_string,
             "key_type": key_type,
-            "duration_days": days,
+            "duration_label": _duration_label(key_data),
+        }
+        if duration_hours:
+            resp["duration_hours"] = duration_hours
+        else:
+            resp["duration_days"] = duration_days
+        return jsonify(resp), 201
+    except Exception as e:
+        return jsonify({"error": f"Lỗi tạo key: {e}"}), 500
+
+
+@app.route('/api/createkey3h', methods=['POST'])
+@login_required
+@require_json
+def create_key_3h():
+    """Shortcut: tạo key 3 giờ — ShopBoutique - XXXXXXXX"""
+    if not _check_db():
+        return jsonify({"error": "Lỗi kết nối cơ sở dữ liệu"}), 500
+
+    data = request.get_json() or {}
+    data = {**data, "duration_preset": "3h"}
+    duration_days, duration_hours, dur_err = _parse_duration_from_request(data)
+    if dur_err:
+        return jsonify({"error": dur_err}), 400
+
+    key_type = data.get('key_type', 'single_device')
+    if key_type not in ('single_device', 'multi_device'):
+        return jsonify({"error": "key_type không hợp lệ"}), 400
+
+    for _ in range(5):
+        key_string = generate_key_string()
+        key_doc_ref = get_key_doc(key_string)
+        if not key_doc_ref.get().exists:
+            break
+    else:
+        return jsonify({"error": "Không thể tạo key duy nhất — thử lại"}), 500
+
+    key_data = {
+        "key_string": key_string,
+        "key_type": key_type,
+        "duration_days": 0,
+        "duration_hours": 3,
+        "expires_at": None,
+        "created_at": _now_iso(),
+        "created_by": (data.get('created_by') or 'AdminPanel').strip()[:64],
+        "note": (data.get('note') or 'Key 3 giờ').strip()[:256],
+        "hwid": None,
+        "ip_address": None,
+        "first_activated_at": None,
+        "is_banned": False,
+        "violations": 0,
+        "devices": {},
+    }
+
+    try:
+        key_doc_ref.set(key_data)
+        return jsonify({
+            "message": "Tạo key 3 giờ thành công!",
+            "key": key_string,
+            "key_type": key_type,
+            "duration_hours": 3,
+            "duration_label": "3 giờ",
         }), 201
     except Exception as e:
         return jsonify({"error": f"Lỗi tạo key: {e}"}), 500
@@ -378,12 +478,17 @@ def redeem_key():
 
     now = datetime.now()
     first_activated_at = key_data.get('first_activated_at')
-    duration_days = key_data.get('duration_days', 0)
     key_type = key_data.get('key_type', 'single_device')
 
     # First activation
     if not first_activated_at:
-        expires_at = (now + timedelta(days=duration_days)).isoformat()
+        exp_dt = _compute_expiry(now.isoformat(), key_data)
+        if exp_dt is None:
+            if key_data.get('duration_hours'):
+                exp_dt = now + timedelta(hours=int(key_data['duration_hours']))
+            else:
+                exp_dt = now + timedelta(days=int(key_data.get('duration_days', 0) or 0))
+        expires_at = exp_dt.isoformat()
         updates = {
             "first_activated_at": now.isoformat(),
             "expires_at": expires_at,
@@ -397,17 +502,17 @@ def redeem_key():
             "status": "success",
             "message": "Key kích hoạt thành công (lần đầu)",
             "expires_at": expires_at,
+            "duration_label": _duration_label(key_data),
         }), 200
 
     # Check expiry
-    exp = _compute_expiry(key_data['first_activated_at'], duration_days)
+    exp = _compute_expiry(key_data['first_activated_at'], key_data)
     if exp is None or now > exp:
         return jsonify({"status": "error", "message": "Key đã hết hạn"}), 403
 
     # HWID enforcement for single_device keys
     stored_hwid = key_data.get('hwid')
     if key_type == 'single_device' and stored_hwid and stored_hwid != hwid:
-        # Increment violations counter
         try:
             key_doc_ref.update({"violations": firestore.Increment(1)})
         except Exception:
@@ -427,10 +532,11 @@ def redeem_key():
         "expires_at": exp.isoformat(),
         "registered_hwid": stored_hwid,
         "current_server_time": now.isoformat(),
+        "duration_label": _duration_label(key_data),
     }), 200
 
 
-@app.route('/api/keyinfo/<string:key_string>')
+@app.route('/api/keyinfo/<path:key_string>')
 @login_required
 def key_info(key_string: str):
     if not _check_db():
@@ -451,6 +557,9 @@ def key_info(key_string: str):
         "status": status_text,
         "is_banned": d.get('is_banned', False),
         "expires_at": expires_display,
+        "duration_days": d.get('duration_days', 0),
+        "duration_hours": d.get('duration_hours'),
+        "duration_label": _duration_label(d),
         "hwid": d.get('hwid') or "Chưa đăng ký",
         "ip_address": d.get('ip_address') or "N/A",
         "first_activated_at": d.get('first_activated_at') or "Chưa kích hoạt",
@@ -462,7 +571,7 @@ def key_info(key_string: str):
     })
 
 
-@app.route('/api/keystats/<string:key_string>')
+@app.route('/api/keystats/<path:key_string>')
 @login_required
 def key_stats(key_string: str):
     if not _check_db():
@@ -477,7 +586,6 @@ def key_stats(key_string: str):
     devices: dict = d.get('devices') or {}
     total_devices = len(devices)
 
-    # Fetch recent access logs
     limit = min(int(request.args.get('limit', 30)), 100)
     logs = []
     try:
@@ -504,6 +612,7 @@ def key_stats(key_string: str):
         "active_devices": active_devices,
         "last_used": last_used,
         "violations": d.get('violations', 0),
+        "duration_label": _duration_label(d),
         "logs": logs,
     })
 
@@ -525,7 +634,6 @@ def delete_key():
     if not doc.exists:
         return jsonify({"error": "Key không tồn tại"}), 404
 
-    # Delete sub-collections (access_logs) first to avoid orphaned data
     try:
         for log_doc in ref.collection("access_logs").limit(500).stream():
             log_doc.reference.delete()
@@ -603,6 +711,9 @@ def get_all_keys():
                 "key_string": kd.get('key_string'),
                 "key_type": kd.get('key_type', 'single_device'),
                 "expires_at": expires_display,
+                "duration_label": _duration_label(kd),
+                "duration_hours": kd.get('duration_hours'),
+                "duration_days": kd.get('duration_days', 0),
                 "hwid": kd.get('hwid') or "Chưa đăng ký",
                 "ip_address": kd.get('ip_address') or "N/A",
                 "first_activated_at": kd.get('first_activated_at') or "Chưa kích hoạt",
@@ -631,6 +742,7 @@ def health():
         "status": "ok",
         "db": "connected" if db else "disconnected",
         "time": _now_iso(),
+        "key_format": f"{KEY_PREFIX} - XXXXXXXX",
     })
 
 
