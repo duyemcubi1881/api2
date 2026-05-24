@@ -1,37 +1,59 @@
 import os
+import hmac as _hmac
+import hashlib
+import random
+import string
+import json
+import time
+
 from datetime import datetime, timedelta
-import random, string, json, time
 from functools import wraps
+
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
+from werkzeug.security import check_password_hash, generate_password_hash
+
 import firebase_admin
 from firebase_admin import credentials, firestore
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========= App & Security Config =========
+# =========================================================
+# App & Security Config
+# =========================================================
+
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY') or 'fallback_secret_key_DO_NOT_USE_IN_PRODUCTION'
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=int(os.getenv("SESSION_MINUTES", "30")))
-app.config['SESSION_COOKIE_SAMESITE'] = 'None'
-app.config['SESSION_COOKIE_SECURE'] = True
-app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or "fallback_secret_key_DO_NOT_USE_IN_PRODUCTION"
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=int(os.getenv("SESSION_MINUTES", "30")))
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
-CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "*")
+CORS(
+    app,
+    supports_credentials=True,
+    origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "*",
+)
 
 # Anti-bruteforce (in-memory)
 LOGIN_RPM = int(os.getenv("LOGIN_RPM", "10"))
 _login_bucket: dict = {}
 
-# ========= Firebase =========
+# =========================================================
+# Firebase Init
+# =========================================================
+
 db = None
+
 try:
-    firebase_service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
+    firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
     cred = None
-    if firebase_service_account_json:
-        cfg = json.loads(firebase_service_account_json)
+
+    if firebase_json:
+        cfg = json.loads(firebase_json)
         if "private_key" in cfg:
             cfg["private_key"] = cfg["private_key"].replace("\\n", "\n")
         cred = credentials.Certificate(cfg)
@@ -40,7 +62,7 @@ try:
             "type": os.getenv("FIREBASE_TYPE"),
             "project_id": os.getenv("FIREBASE_PROJECT_ID"),
             "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-            "private_key": (os.getenv("FIREBASE_PRIVATE_KEY") or "").replace('\\n', '\n') or None,
+            "private_key": (os.getenv("FIREBASE_PRIVATE_KEY") or "").replace("\\n", "\n") or None,
             "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
             "client_id": os.getenv("FIREBASE_CLIENT_ID"),
             "auth_uri": os.getenv("FIREBASE_AUTH_URI"),
@@ -58,30 +80,51 @@ try:
         print("✅ Firebase connected")
     else:
         print("❌ Firebase not initialized — check environment variables")
+
 except Exception as e:
     print("🔥 Firebase init error:", e)
 
-# ========= Admin Auth =========
-from werkzeug.security import check_password_hash, generate_password_hash
+# =========================================================
+# Admin Auth
+# =========================================================
 
-ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
-ADMIN_PASSWORD_HASH = os.getenv('ADMIN_PASSWORD_HASH')
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
 if not ADMIN_PASSWORD_HASH:
-    ADMIN_PASSWORD_HASH = generate_password_hash(os.getenv('ADMIN_PASSWORD', 'admin123'))
+    ADMIN_PASSWORD_HASH = generate_password_hash(os.getenv("ADMIN_PASSWORD", "admin123"))
+
+# Optional HMAC request signature
+CLIENT_HMAC_SECRET = os.getenv("CLIENT_HMAC_SECRET")
+
+# =========================================================
+# Key Format: ShopBoutique - XXXXXXXX
+# =========================================================
+
+KEY_PREFIX = "ShopBoutiqueLegit"
+KEY_SUFFIX_LENGTH = 8
+KEY_CHARS = string.ascii_uppercase + string.digits
 
 
-def _rate_limit_login(ip: str) -> bool:
-    """Return True if the IP is rate-limited."""
-    window = 300  # 5 minutes
-    now = time.time()
-    bucket = [t for t in _login_bucket.get(ip, []) if now - t < window]
-    if len(bucket) >= LOGIN_RPM:
-        _login_bucket[ip] = bucket
-        return True
-    bucket.append(now)
-    _login_bucket[ip] = bucket
-    return False
+def generate_key_string() -> str:
+    suffix = "".join(random.choices(KEY_CHARS, k=KEY_SUFFIX_LENGTH))
+    return f"{KEY_PREFIX} - {suffix}"
 
+
+def is_valid_key_format(key_string: str) -> bool:
+    if not isinstance(key_string, str):
+        return False
+    expected_sep = f"{KEY_PREFIX} - "
+    if not key_string.startswith(expected_sep):
+        return False
+    suffix = key_string[len(expected_sep):]
+    if len(suffix) < 3 or len(suffix) > 32:
+        return False
+    return suffix.isalnum()
+
+
+# =========================================================
+# Decorators
+# =========================================================
 
 def require_json(f):
     @wraps(f)
@@ -95,17 +138,10 @@ def require_json(f):
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get('logged_in'):
+        if not session.get("logged_in"):
             return jsonify({"error": "Không được ủy quyền. Vui lòng đăng nhập."}), 401
         return f(*args, **kwargs)
     return decorated
-
-
-# Optional HMAC request signature check
-import hmac as _hmac
-import hashlib
-
-CLIENT_HMAC_SECRET = os.getenv("CLIENT_HMAC_SECRET")
 
 
 def hmac_required(f):
@@ -130,76 +166,69 @@ def hmac_required(f):
     return w
 
 
-# ========= Key Format: ShopBoutique - XXXXXXXX =========
-KEY_PREFIX = "ShopBoutiqueLegit"
-KEY_SUFFIX_LENGTH = 8
-KEY_CHARS = string.ascii_uppercase + string.digits
+# =========================================================
+# Rate Limit Helper
+# =========================================================
+
+def _rate_limit_login(ip: str) -> bool:
+    """Return True if the IP is rate-limited (10 attempts per 5 minutes)."""
+    window = 300
+    now = time.time()
+    bucket = [t for t in _login_bucket.get(ip, []) if now - t < window]
+    if len(bucket) >= LOGIN_RPM:
+        _login_bucket[ip] = bucket
+        return True
+    bucket.append(now)
+    _login_bucket[ip] = bucket
+    return False
 
 
-def generate_key_string() -> str:
-    suffix = ''.join(random.choices(KEY_CHARS, k=KEY_SUFFIX_LENGTH))
-    return f"{KEY_PREFIX} - {suffix}"
+# =========================================================
+# Duration Helpers
+# =========================================================
 
-
-def is_valid_key_format(key_string: str) -> bool:
-    """Quick sanity check — rejects obviously malformed keys."""
-    if not isinstance(key_string, str):
-        return False
-    expected_sep = f"{KEY_PREFIX} - "
-    if not key_string.startswith(expected_sep):
-        return False
-    suffix = key_string[len(expected_sep):]
-    if len(suffix) < 3 or len(suffix) > 32:
-        return False
-    return suffix.isalnum()
-
-
-# ========= Duration helpers =========
-def _parse_duration_from_request(data: dict) -> tuple[int | None, int | None, str | None]:
+def _parse_duration_from_request(data: dict) -> tuple:
     """
     Returns (duration_days, duration_hours, error_message).
-    Use hours OR days, not both. Preset: duration_preset = '3h'
+    Priority: preset > hours > days. Default = 3 days.
     """
-    preset = (data.get('duration_preset') or '').strip().lower()
-    if preset in ('3h', '3hours', '3_gio', '3gio'):
+    preset = (data.get("duration_preset") or "").strip().lower()
+    if preset in ("3h", "3hours", "3_gio", "3gio"):
         return 0, 3, None
 
-    if 'hours' in data and data.get('hours') is not None:
+    if "hours" in data and data.get("hours") is not None:
         try:
-            hours = int(data['hours'])
+            hours = int(data["hours"])
         except (ValueError, TypeError):
             return None, None, "hours không hợp lệ — phải là số nguyên dương"
         if hours <= 0:
             return None, None, "Số giờ phải > 0"
         return 0, hours, None
 
-    if 'days' in data and data.get('days') is not None:
+    if "days" in data and data.get("days") is not None:
         try:
-            days = int(data['days'])
+            days = int(data["days"])
         except (ValueError, TypeError):
             return None, None, "days không hợp lệ — phải là số nguyên dương"
         if days <= 0:
             return None, None, "Số ngày phải > 0"
         return days, None, None
 
-    # Default: 3 days (backward compatible)
-    return int(data.get('days', 3) if data.get('days') is not None else 3), None, None
+    # Default: 3 days
+    return 3, None, None
 
 
 def _duration_label(key_data: dict) -> str:
-    hours = key_data.get('duration_hours')
-    if hours:
+    hours = key_data.get("duration_hours")
+    if hours and int(hours) > 0:
         return f"{hours} giờ"
-    days = key_data.get('duration_days', 0)
+    days = key_data.get("duration_days", 0)
     return f"{days} ngày"
 
 
-# ========= Firestore Helpers =========
-def get_key_doc(key_string: str):
-    if db is None:
-        return None
-    return db.collection('keys').document(key_string)
-
+# =========================================================
+# FIX: _compute_expiry — kiểm tra hours TRƯỚC days
+# =========================================================
 
 def _now_iso() -> str:
     return datetime.now().isoformat()
@@ -212,21 +241,79 @@ def _parse_iso(dt_str: str):
         return None
 
 
-def _compute_expiry(first_activated_at: str, key_data: dict) -> datetime | None:
+def _compute_expiry(first_activated_at: str, key_data: dict):
+    """
+    Tính thời điểm hết hạn dựa trên first_activated_at + duration.
+    ✅ Ưu tiên duration_hours trước duration_days.
+    Trả về datetime hoặc None nếu dữ liệu không hợp lệ.
+    """
     dt = _parse_iso(first_activated_at)
     if dt is None:
         return None
-    hours = key_data.get('duration_hours')
-    if hours:
-        return dt + timedelta(hours=int(hours))
-    days = key_data.get('duration_days', 0)
+
+    # ✅ Kiểm tra hours trước — đây là fix chính
+    hours = key_data.get("duration_hours")
+    if hours is not None:
+        try:
+            hours = int(hours)
+        except (ValueError, TypeError):
+            hours = 0
+        if hours > 0:
+            return dt + timedelta(hours=hours)
+
+    # Sau đó mới kiểm tra days
+    days = key_data.get("duration_days", 0)
+    try:
+        days = int(days)
+    except (ValueError, TypeError):
+        days = 0
+
     if days <= 0:
         return None
-    return dt + timedelta(days=int(days))
+
+    return dt + timedelta(days=days)
 
 
-def update_usage_tracking(key_doc_ref, key_data: dict, hwid: str,
-                          machine_name: str, ip_address: str, extra_info: dict | None = None):
+# =========================================================
+# Firestore Helpers
+# =========================================================
+
+def _check_db() -> bool:
+    return db is not None
+
+
+def get_key_doc(key_string: str):
+    if db is None:
+        return None
+    return db.collection("keys").document(key_string)
+
+
+def _build_status(kd: dict, now: datetime) -> tuple:
+    """Return (status_text, expires_display)."""
+    if kd.get("is_banned"):
+        return "BANNED", kd.get("expires_at") or "N/A"
+
+    fa = kd.get("first_activated_at")
+    if not fa:
+        return "Chưa kích hoạt", "Chưa kích hoạt"
+
+    exp = _compute_expiry(fa, kd)
+    if exp is None:
+        return "Chưa kích hoạt", "Chưa kích hoạt"
+
+    expires_display = exp.strftime("%Y-%m-%d %H:%M:%S")
+    status_text = "Hết Hạn" if now > exp else "Đang hoạt động"
+    return status_text, expires_display
+
+
+def update_usage_tracking(
+    key_doc_ref,
+    key_data: dict,
+    hwid: str,
+    machine_name: str,
+    ip_address: str,
+    extra_info: dict = None,
+):
     extra_info = extra_info or {}
     machine_name = machine_name or "UnknownMachine"
     now_iso = _now_iso()
@@ -239,6 +326,7 @@ def update_usage_tracking(key_doc_ref, key_data: dict, hwid: str,
         "action": "redeem",
         **extra_info,
     }
+
     try:
         key_doc_ref.collection("access_logs").add(log_entry)
     except Exception as e:
@@ -255,48 +343,42 @@ def update_usage_tracking(key_doc_ref, key_data: dict, hwid: str,
         "usage_count": (dev.get("usage_count", 0) + 1) if dev else 1,
         "extra_info": extra_info,
     }
+
     try:
         key_doc_ref.update({f"devices.{hwid}": new_entry})
     except Exception as e:
         print("WARN update devices:", e)
 
 
-# ========= Shared status helper =========
-def _build_status(kd: dict, now: datetime) -> tuple[str, str]:
-    """Return (status_text, expires_display)."""
-    if kd.get('is_banned'):
-        return "BANNED", kd.get('expires_at') or "N/A"
+# =========================================================
+# Routes — Public
+# =========================================================
 
-    fa = kd.get('first_activated_at')
-    if not fa:
-        return "Chưa kích hoạt", "Chưa kích hoạt"
-
-    exp = _compute_expiry(fa, kd)
-    if exp is None:
-        return "Chưa kích hoạt", "Chưa kích hoạt"
-
-    expires_display = exp.strftime("%Y-%m-%d %H:%M:%S")
-    status_text = "Hết Hạn" if now > exp else "Đang hoạt động"
-    return status_text, expires_display
-
-
-def _check_db() -> bool:
-    return db is not None
-
-
-# ========= Routes =========
-
-@app.route('/')
+@app.route("/")
 def home():
     return jsonify({"status": "ok", "service": "Shop Boutique Key Backend"})
 
 
-@app.route('/api/session')
+@app.route("/api/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "db": "connected" if db else "disconnected",
+        "time": _now_iso(),
+        "key_format": f"{KEY_PREFIX} - XXXXXXXX",
+    })
+
+
+@app.route("/api/session")
 def session_info():
-    return jsonify({"logged_in": bool(session.get('logged_in'))})
+    return jsonify({"logged_in": bool(session.get("logged_in"))})
 
 
-@app.route('/api/login', methods=['POST'])
+# =========================================================
+# Routes — Auth
+# =========================================================
+
+@app.route("/api/login", methods=["POST"])
 @require_json
 def login():
     ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "0.0.0.0"
@@ -304,26 +386,30 @@ def login():
         return jsonify({"error": "Vượt quá số lần thử. Thử lại sau 5 phút."}), 429
 
     data = request.get_json() or {}
-    username = (data.get('username') or "").strip()
-    password = data.get('password') or ""
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
 
     if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
         session.clear()
-        session['logged_in'] = True
+        session["logged_in"] = True
         session.permanent = True
         return jsonify({"message": "Đăng nhập thành công!"}), 200
 
     return jsonify({"error": "Tài khoản hoặc mật khẩu không đúng."}), 401
 
 
-@app.route('/api/logout', methods=['POST'])
+@app.route("/api/logout", methods=["POST"])
 @login_required
 def logout():
     session.clear()
     return jsonify({"message": "Đăng xuất thành công."}), 200
 
 
-@app.route('/api/createkey', methods=['POST'])
+# =========================================================
+# Routes — Key Management (Admin)
+# =========================================================
+
+@app.route("/api/createkey", methods=["POST"])
 @login_required
 @require_json
 def create_key():
@@ -335,8 +421,8 @@ def create_key():
     if dur_err:
         return jsonify({"error": dur_err}), 400
 
-    key_type = data.get('key_type', 'single_device')
-    if key_type not in ('single_device', 'multi_device'):
+    key_type = data.get("key_type", "single_device")
+    if key_type not in ("single_device", "multi_device"):
         return jsonify({"error": "key_type không hợp lệ"}), 400
 
     # Retry on unlikely collision
@@ -352,11 +438,11 @@ def create_key():
         "key_string": key_string,
         "key_type": key_type,
         "duration_days": duration_days or 0,
-        "duration_hours": duration_hours,
+        "duration_hours": duration_hours,   # None nếu dùng days
         "expires_at": None,
         "created_at": _now_iso(),
-        "created_by": (data.get('created_by') or 'AdminPanel').strip()[:64],
-        "note": (data.get('note') or '').strip()[:256],
+        "created_by": (data.get("created_by") or "AdminPanel").strip()[:64],
+        "note": (data.get("note") or "").strip()[:256],
         "hwid": None,
         "ip_address": None,
         "first_activated_at": None,
@@ -382,22 +468,17 @@ def create_key():
         return jsonify({"error": f"Lỗi tạo key: {e}"}), 500
 
 
-@app.route('/api/createkey3h', methods=['POST'])
+@app.route("/api/createkey3h", methods=["POST"])
 @login_required
 @require_json
 def create_key_3h():
-    """Shortcut: tạo key 3 giờ — ShopBoutique - XXXXXXXX"""
+    """Shortcut: tạo key 3 giờ single_device."""
     if not _check_db():
         return jsonify({"error": "Lỗi kết nối cơ sở dữ liệu"}), 500
 
     data = request.get_json() or {}
-    data = {**data, "duration_preset": "3h"}
-    duration_days, duration_hours, dur_err = _parse_duration_from_request(data)
-    if dur_err:
-        return jsonify({"error": dur_err}), 400
-
-    key_type = data.get('key_type', 'single_device')
-    if key_type not in ('single_device', 'multi_device'):
+    key_type = data.get("key_type", "single_device")
+    if key_type not in ("single_device", "multi_device"):
         return jsonify({"error": "key_type không hợp lệ"}), 400
 
     for _ in range(5):
@@ -415,8 +496,8 @@ def create_key_3h():
         "duration_hours": 3,
         "expires_at": None,
         "created_at": _now_iso(),
-        "created_by": (data.get('created_by') or 'AdminPanel').strip()[:64],
-        "note": (data.get('note') or 'Key 3 giờ').strip()[:256],
+        "created_by": (data.get("created_by") or "AdminPanel").strip()[:64],
+        "note": (data.get("note") or "Key 3 giờ").strip()[:256],
         "hwid": None,
         "ip_address": None,
         "first_activated_at": None,
@@ -438,186 +519,7 @@ def create_key_3h():
         return jsonify({"error": f"Lỗi tạo key: {e}"}), 500
 
 
-@app.route('/api/redeem', methods=['POST'])
-@require_json
-@hmac_required
-def redeem_key():
-    if not _check_db():
-        return jsonify({"status": "error", "message": "Lỗi cơ sở dữ liệu"}), 500
-
-    data = request.get_json() or {}
-    key_string = (data.get('key') or "").strip()
-    hwid = (data.get('hwid') or "").strip()
-    machine_name = (data.get('machine_name') or "UnknownMachine").strip()
-    ip_address = request.headers.get("CF-Connecting-IP") or request.remote_addr
-
-    extra_info = {
-        "windows_version": data.get('windows_version', 'N/A'),
-        "cpu_name": data.get('cpu_name', 'N/A'),
-        "disk_serial": data.get('disk_serial', 'N/A'),
-        "ram_total_gb": data.get('ram_total_gb', 'N/A'),
-        "gpu_name": data.get('gpu_name', 'N/A'),
-        "client_version": data.get('client_version', 'N/A'),
-    }
-
-    if not key_string or not hwid:
-        return jsonify({"status": "error", "message": "Thiếu key hoặc HWID"}), 400
-
-    if not is_valid_key_format(key_string):
-        return jsonify({"status": "error", "message": "Định dạng key không hợp lệ"}), 400
-
-    key_doc_ref = get_key_doc(key_string)
-    key_doc = key_doc_ref.get()
-    if not key_doc.exists:
-        return jsonify({"status": "error", "message": "Key không tồn tại"}), 404
-
-    key_data = key_doc.to_dict()
-
-    if key_data.get('is_banned'):
-        return jsonify({"status": "error", "message": "Key đã bị cấm"}), 403
-
-    now = datetime.now()
-    first_activated_at = key_data.get('first_activated_at')
-    key_type = key_data.get('key_type', 'single_device')
-
-    # First activation
-    if not first_activated_at:
-        exp_dt = _compute_expiry(now.isoformat(), key_data)
-        if exp_dt is None:
-            if key_data.get('duration_hours'):
-                exp_dt = now + timedelta(hours=int(key_data['duration_hours']))
-            else:
-                exp_dt = now + timedelta(days=int(key_data.get('duration_days', 0) or 0))
-        expires_at = exp_dt.isoformat()
-        updates = {
-            "first_activated_at": now.isoformat(),
-            "expires_at": expires_at,
-            "hwid": hwid,
-            "ip_address": ip_address,
-        }
-        key_doc_ref.update(updates)
-        key_data.update(updates)
-        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
-        return jsonify({
-            "status": "success",
-            "message": "Key kích hoạt thành công (lần đầu)",
-            "expires_at": expires_at,
-            "duration_label": _duration_label(key_data),
-        }), 200
-
-    # Check expiry
-    exp = _compute_expiry(key_data['first_activated_at'], key_data)
-    if exp is None or now > exp:
-        return jsonify({"status": "error", "message": "Key đã hết hạn"}), 403
-
-    # HWID enforcement for single_device keys
-    stored_hwid = key_data.get('hwid')
-    if key_type == 'single_device' and stored_hwid and stored_hwid != hwid:
-        try:
-            key_doc_ref.update({"violations": firestore.Increment(1)})
-        except Exception:
-            pass
-        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
-        return jsonify({
-            "status": "error",
-            "message": "Key này đã được kích hoạt trên thiết bị khác",
-            "registered_hwid": stored_hwid,
-            "your_hwid": hwid,
-        }), 403
-
-    update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
-    return jsonify({
-        "status": "success",
-        "message": "Key hợp lệ",
-        "expires_at": exp.isoformat(),
-        "registered_hwid": stored_hwid,
-        "current_server_time": now.isoformat(),
-        "duration_label": _duration_label(key_data),
-    }), 200
-
-
-@app.route('/api/keyinfo/<path:key_string>')
-@login_required
-def key_info(key_string: str):
-    if not _check_db():
-        return jsonify({"error": "DB error"}), 500
-
-    key_doc_ref = get_key_doc(key_string)
-    doc = key_doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Key không tồn tại"}), 404
-
-    d = doc.to_dict()
-    now = datetime.now()
-    status_text, expires_display = _build_status(d, now)
-
-    return jsonify({
-        "key": d.get('key_string'),
-        "key_type": d.get('key_type', 'single_device'),
-        "status": status_text,
-        "is_banned": d.get('is_banned', False),
-        "expires_at": expires_display,
-        "duration_days": d.get('duration_days', 0),
-        "duration_hours": d.get('duration_hours'),
-        "duration_label": _duration_label(d),
-        "hwid": d.get('hwid') or "Chưa đăng ký",
-        "ip_address": d.get('ip_address') or "N/A",
-        "first_activated_at": d.get('first_activated_at') or "Chưa kích hoạt",
-        "created_by": d.get('created_by'),
-        "created_at": d.get('created_at'),
-        "note": d.get('note', ''),
-        "violations": d.get('violations', 0),
-        "devices": d.get('devices', {}),
-    })
-
-
-@app.route('/api/keystats/<path:key_string>')
-@login_required
-def key_stats(key_string: str):
-    if not _check_db():
-        return jsonify({"error": "DB error"}), 500
-
-    key_doc_ref = get_key_doc(key_string)
-    doc = key_doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Key không tồn tại"}), 404
-
-    d = doc.to_dict()
-    devices: dict = d.get('devices') or {}
-    total_devices = len(devices)
-
-    limit = min(int(request.args.get('limit', 30)), 100)
-    logs = []
-    try:
-        log_docs = (key_doc_ref.collection("access_logs")
-                    .order_by("ts", direction=firestore.Query.DESCENDING)
-                    .limit(limit)
-                    .stream())
-        logs = [ld.to_dict() for ld in log_docs]
-    except Exception as e:
-        print("WARN keystats logs:", e)
-
-    last_used = logs[0].get('ts') if logs else None
-
-    now = datetime.now()
-    active_devices = sum(
-        1 for dev in devices.values()
-        if dev.get('last_seen') and _parse_iso(dev['last_seen']) and
-           (now - _parse_iso(dev['last_seen'])) < timedelta(hours=24)
-    )
-
-    return jsonify({
-        "key": key_string,
-        "total_devices": total_devices,
-        "active_devices": active_devices,
-        "last_used": last_used,
-        "violations": d.get('violations', 0),
-        "duration_label": _duration_label(d),
-        "logs": logs,
-    })
-
-
-@app.route('/api/deletekey', methods=['POST'])
+@app.route("/api/deletekey", methods=["POST"])
 @login_required
 @require_json
 def delete_key():
@@ -625,7 +527,7 @@ def delete_key():
         return jsonify({"error": "DB error"}), 500
 
     data = request.get_json() or {}
-    key_string = (data.get('key') or "").strip()
+    key_string = (data.get("key") or "").strip()
     if not key_string:
         return jsonify({"error": "Thiếu key"}), 400
 
@@ -644,7 +546,7 @@ def delete_key():
     return jsonify({"message": f"Đã xoá {key_string}"}), 200
 
 
-@app.route('/api/ban', methods=['POST'])
+@app.route("/api/ban", methods=["POST"])
 @login_required
 @require_json
 def ban_key():
@@ -652,7 +554,7 @@ def ban_key():
         return jsonify({"error": "DB error"}), 500
 
     data = request.get_json() or {}
-    key_string = (data.get('key') or "").strip()
+    key_string = (data.get("key") or "").strip()
     if not key_string:
         return jsonify({"error": "Thiếu key"}), 400
 
@@ -664,7 +566,7 @@ def ban_key():
     return jsonify({"message": f"Đã ban {key_string}"}), 200
 
 
-@app.route('/api/unban', methods=['POST'])
+@app.route("/api/unban", methods=["POST"])
 @login_required
 @require_json
 def unban_key():
@@ -672,7 +574,7 @@ def unban_key():
         return jsonify({"error": "DB error"}), 500
 
     data = request.get_json() or {}
-    key_string = (data.get('key') or "").strip()
+    key_string = (data.get("key") or "").strip()
     if not key_string:
         return jsonify({"error": "Thiếu key"}), 400
 
@@ -684,7 +586,95 @@ def unban_key():
     return jsonify({"message": f"Đã unban {key_string}"}), 200
 
 
-@app.route('/api/keys')
+# =========================================================
+# Routes — Key Info (Admin)
+# =========================================================
+
+@app.route("/api/keyinfo/<path:key_string>")
+@login_required
+def key_info(key_string: str):
+    if not _check_db():
+        return jsonify({"error": "DB error"}), 500
+
+    key_doc_ref = get_key_doc(key_string)
+    doc = key_doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Key không tồn tại"}), 404
+
+    d = doc.to_dict()
+    now = datetime.now()
+    status_text, expires_display = _build_status(d, now)
+
+    return jsonify({
+        "key": d.get("key_string"),
+        "key_type": d.get("key_type", "single_device"),
+        "status": status_text,
+        "is_banned": d.get("is_banned", False),
+        "expires_at": expires_display,
+        "duration_days": d.get("duration_days", 0),
+        "duration_hours": d.get("duration_hours"),
+        "duration_label": _duration_label(d),
+        "hwid": d.get("hwid") or "Chưa đăng ký",
+        "ip_address": d.get("ip_address") or "N/A",
+        "first_activated_at": d.get("first_activated_at") or "Chưa kích hoạt",
+        "created_by": d.get("created_by"),
+        "created_at": d.get("created_at"),
+        "note": d.get("note", ""),
+        "violations": d.get("violations", 0),
+        "devices": d.get("devices", {}),
+    })
+
+
+@app.route("/api/keystats/<path:key_string>")
+@login_required
+def key_stats(key_string: str):
+    if not _check_db():
+        return jsonify({"error": "DB error"}), 500
+
+    key_doc_ref = get_key_doc(key_string)
+    doc = key_doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Key không tồn tại"}), 404
+
+    d = doc.to_dict()
+    devices: dict = d.get("devices") or {}
+    total_devices = len(devices)
+    limit = min(int(request.args.get("limit", 30)), 100)
+
+    logs = []
+    try:
+        log_docs = (
+            key_doc_ref.collection("access_logs")
+            .order_by("ts", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        logs = [ld.to_dict() for ld in log_docs]
+    except Exception as e:
+        print("WARN keystats logs:", e)
+
+    last_used = logs[0].get("ts") if logs else None
+    now = datetime.now()
+    active_devices = sum(
+        1
+        for dev in devices.values()
+        if dev.get("last_seen")
+        and _parse_iso(dev["last_seen"])
+        and (now - _parse_iso(dev["last_seen"])) < timedelta(hours=24)
+    )
+
+    return jsonify({
+        "key": key_string,
+        "total_devices": total_devices,
+        "active_devices": active_devices,
+        "last_used": last_used,
+        "violations": d.get("violations", 0),
+        "duration_label": _duration_label(d),
+        "logs": logs,
+    })
+
+
+@app.route("/api/keys")
 @login_required
 def get_all_keys():
     if not _check_db():
@@ -694,7 +684,7 @@ def get_all_keys():
         page = max(1, int(request.args.get("page", "1")))
         page_size = min(max(1, int(request.args.get("page_size", "100"))), 500)
 
-        keys_ref = db.collection('keys')
+        keys_ref = db.collection("keys")
         try:
             docs = list(
                 keys_ref.order_by("created_at", direction=firestore.Query.DESCENDING).stream()
@@ -708,43 +698,159 @@ def get_all_keys():
             kd = key_doc.to_dict()
             status_text, expires_display = _build_status(kd, now)
             rows.append({
-                "key_string": kd.get('key_string'),
-                "key_type": kd.get('key_type', 'single_device'),
+                "key_string": kd.get("key_string"),
+                "key_type": kd.get("key_type", "single_device"),
                 "expires_at": expires_display,
                 "duration_label": _duration_label(kd),
-                "duration_hours": kd.get('duration_hours'),
-                "duration_days": kd.get('duration_days', 0),
-                "hwid": kd.get('hwid') or "Chưa đăng ký",
-                "ip_address": kd.get('ip_address') or "N/A",
-                "first_activated_at": kd.get('first_activated_at') or "Chưa kích hoạt",
-                "created_by": kd.get('created_by'),
-                "created_at": kd.get('created_at'),
-                "is_banned": bool(kd.get('is_banned')),
+                "duration_hours": kd.get("duration_hours"),
+                "duration_days": kd.get("duration_days", 0),
+                "hwid": kd.get("hwid") or "Chưa đăng ký",
+                "ip_address": kd.get("ip_address") or "N/A",
+                "first_activated_at": kd.get("first_activated_at") or "Chưa kích hoạt",
+                "created_by": kd.get("created_by"),
+                "created_at": kd.get("created_at"),
+                "is_banned": bool(kd.get("is_banned")),
                 "status_text": status_text,
-                "violations": kd.get('violations', 0),
-                "note": kd.get('note', ''),
+                "violations": kd.get("violations", 0),
+                "note": kd.get("note", ""),
             })
 
         total = len(rows)
         start = (page - 1) * page_size
         items = rows[start: start + page_size]
-
         return jsonify({"items": items, "total": total, "page": page, "page_size": page_size})
 
     except Exception as e:
         return jsonify({"error": f"Lỗi khi tải keys: {str(e)}"}), 500
 
 
-# ========= Health check =========
-@app.route('/api/health')
-def health():
-    return jsonify({
-        "status": "ok",
-        "db": "connected" if db else "disconnected",
-        "time": _now_iso(),
-        "key_format": f"{KEY_PREFIX} - XXXXXXXX",
-    })
+# =========================================================
+# Routes — Redeem (Client)
+# =========================================================
 
+@app.route("/api/redeem", methods=["POST"])
+@require_json
+@hmac_required
+def redeem_key():
+    if not _check_db():
+        return jsonify({"status": "error", "message": "Lỗi cơ sở dữ liệu"}), 500
+
+    data = request.get_json() or {}
+    key_string   = (data.get("key") or "").strip()
+    hwid         = (data.get("hwid") or "").strip()
+    machine_name = (data.get("machine_name") or "UnknownMachine").strip()
+    ip_address   = request.headers.get("CF-Connecting-IP") or request.remote_addr
+
+    extra_info = {
+        "windows_version": data.get("windows_version", "N/A"),
+        "cpu_name":        data.get("cpu_name", "N/A"),
+        "disk_serial":     data.get("disk_serial", "N/A"),
+        "ram_total_gb":    data.get("ram_total_gb", "N/A"),
+        "gpu_name":        data.get("gpu_name", "N/A"),
+        "client_version":  data.get("client_version", "N/A"),
+    }
+
+    # ── Validate input ──────────────────────────────────────────────
+    if not key_string or not hwid:
+        return jsonify({"status": "error", "message": "Thiếu key hoặc HWID"}), 400
+
+    if not is_valid_key_format(key_string):
+        return jsonify({"status": "error", "message": "Định dạng key không hợp lệ"}), 400
+
+    # ── Fetch key document ──────────────────────────────────────────
+    key_doc_ref = get_key_doc(key_string)
+    key_doc     = key_doc_ref.get()
+
+    if not key_doc.exists:
+        return jsonify({"status": "error", "message": "Key không tồn tại"}), 404
+
+    key_data = key_doc.to_dict()
+
+    # ── Banned check ────────────────────────────────────────────────
+    if key_data.get("is_banned"):
+        return jsonify({"status": "error", "message": "Key đã bị cấm"}), 403
+
+    now = datetime.now()
+    first_activated_at = key_data.get("first_activated_at")
+    key_type           = key_data.get("key_type", "single_device")
+
+    # ── FIRST ACTIVATION ────────────────────────────────────────────
+    if not first_activated_at:
+        # ✅ _compute_expiry đã xử lý đúng hours và days
+        exp_dt = _compute_expiry(now.isoformat(), key_data)
+
+        if exp_dt is None:
+            return jsonify({
+                "status": "error",
+                "message": "Key không có thời hạn hợp lệ, liên hệ admin",
+            }), 400
+
+        expires_at = exp_dt.isoformat()
+        updates = {
+            "first_activated_at": now.isoformat(),
+            "expires_at": expires_at,
+            "hwid": hwid,
+            "ip_address": ip_address,
+        }
+        key_doc_ref.update(updates)
+        key_data.update(updates)
+
+        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+
+        return jsonify({
+            "status": "success",
+            "message": "Key kích hoạt thành công!",
+            "expires_at": expires_at,
+            "expires_display": exp_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_label": _duration_label(key_data),
+        }), 200
+
+    # ── EXPIRY CHECK ─────────────────────────────────────────────────
+    # ✅ _compute_expiry trả đúng datetime cho cả hours lẫn days
+    exp = _compute_expiry(first_activated_at, key_data)
+
+    if exp is None:
+        return jsonify({"status": "error", "message": "Key không có thời hạn hợp lệ"}), 400
+
+    if now > exp:
+        return jsonify({
+            "status": "error",
+            "message": "Key đã hết hạn",
+            "expired_at": exp.strftime("%Y-%m-%d %H:%M:%S"),
+        }), 403
+
+    # ── HWID ENFORCEMENT (single_device) ────────────────────────────
+    stored_hwid = key_data.get("hwid")
+    if key_type == "single_device" and stored_hwid and stored_hwid != hwid:
+        try:
+            key_doc_ref.update({"violations": firestore.Increment(1)})
+        except Exception:
+            pass
+        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+        return jsonify({
+            "status": "error",
+            "message": "Key này đã được kích hoạt trên thiết bị khác",
+            "registered_hwid": stored_hwid,
+            "your_hwid": hwid,
+        }), 403
+
+    # ── SUCCESS ──────────────────────────────────────────────────────
+    update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+
+    return jsonify({
+        "status": "success",
+        "message": "Key hợp lệ",
+        "expires_at": exp.isoformat(),
+        "expires_display": exp.strftime("%Y-%m-%d %H:%M:%S"),
+        "registered_hwid": stored_hwid,
+        "current_server_time": now.isoformat(),
+        "duration_label": _duration_label(key_data),
+    }), 200
+
+
+# =========================================================
+# Entry Point
+# =========================================================
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
